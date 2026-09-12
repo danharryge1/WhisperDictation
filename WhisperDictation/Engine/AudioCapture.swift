@@ -20,6 +20,9 @@ final class AudioCapture {
     /// immediately (VADSegmenter.append does). Cleared by the engine when a
     /// live session ends.
     var onSamples: (([Float]) -> Void)?
+
+    /// RMS of each converted tap batch, split into visualizer bars. Tap thread.
+    var onBarLevels: (([Float]) -> Void)?
     private var configObserver: NSObjectProtocol?
 
     private static let sampleRate: Double = 16000
@@ -57,6 +60,9 @@ final class AudioCapture {
     )!
 
     func startRecording() throws {
+        if audioEngine != nil {
+            _ = stopRecording()
+        }
         let engine = AVAudioEngine()
 
         // Apply the user-selected input device BEFORE prepare()/reading the format,
@@ -143,6 +149,7 @@ final class AudioCapture {
                 let crossedCap = Self.crossesDurationCap(previousCount: previousCount, newCount: self.audioBuffer.count)
                 self.bufferLock.unlock()
                 self.onSamples?(samples)
+                self.onBarLevels?(Self.barEnergies(samples))
                 #if DEBUG
                 fputs("+", stderr) // successful conversion (DEBUG only)
                 #endif
@@ -216,6 +223,36 @@ final class AudioCapture {
 
     var isRecording: Bool {
         audioEngine?.isRunning ?? false
+    }
+
+    static let visualizerBars = 5
+
+    /// Root-mean-square amplitude of a 16 kHz mono tap batch.
+    static func rmsEnergy(_ samples: [Float]) -> Float {
+        rmsEnergy(samples[samples.startIndex..<samples.endIndex])
+    }
+
+    static func rmsEnergy(_ samples: ArraySlice<Float>) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var sum: Float = 0
+        for sample in samples {
+            sum += sample * sample
+        }
+        return sqrt(sum / Float(samples.count))
+    }
+
+    /// Consecutive time slices of one tap buffer, so the island bars follow
+    /// the live waveform instead of a canned bounce.
+    static func barEnergies(_ samples: [Float], bars: Int = visualizerBars) -> [Float] {
+        guard bars > 0 else { return [] }
+        guard !samples.isEmpty else { return Array(repeating: 0, count: bars) }
+        let n = samples.count
+        return (0..<bars).map { i in
+            let start = (i * n) / bars
+            let end = ((i + 1) * n) / bars
+            guard end > start else { return 0 }
+            return rmsEnergy(samples[start..<end])
+        }
     }
 }
 

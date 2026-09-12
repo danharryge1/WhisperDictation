@@ -216,26 +216,36 @@ private struct GeneralSection: View {
             SettingsCard(colorScheme: colorScheme) {
                 CardHeader(
                     "Hotkey",
-                    subtitle: settings.hotkeyMode == .pushToTalk
-                        ? "Hold key to record, release to transcribe"
-                        : "Press to start, press to stop — easier on the wrists"
+                    subtitle: hotkeyModeSubtitle
                 )
                 HotkeyRecorder(keyCode: $settings.hotkeyKeyCode, colorScheme: colorScheme)
 
                 Picker("Mode", selection: $settings.hotkeyMode) {
-                    Text("Push-to-talk").tag(AppSettings.HotkeyMode.pushToTalk)
-                    Text("Toggle — easier on the wrists").tag(AppSettings.HotkeyMode.toggle)
+                    Text("Hold").tag(AppSettings.HotkeyMode.pushToTalk)
+                    Text("Toggle").tag(AppSettings.HotkeyMode.toggle)
+                    Text("Both").tag(AppSettings.HotkeyMode.hybrid)
                 }
                 .pickerStyle(.segmented)
                 .font(.system(size: 13))
                 .accessibilityLabel("Hotkey activation mode")
+
+                if settings.hotkeyMode == .hybrid {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Hold \(hotkeyName) to talk, release to type.")
+                        Text("Double-tap \(hotkeyName), or hold \(hotkeyName) and tap Space, to keep recording. Same action, two ways.")
+                        Text("Tap \(hotkeyName) once to finish. Press Escape to cancel.")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+                }
 
                 if settings.hotkeyMode == .toggle {
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "hand.raised.fill")
                             .foregroundStyle(.secondary)
                             .font(.system(size: 11))
-                        Text("No need to hold the key while you talk — friendlier for long dictations and anyone managing carpal tunnel or RSI.")
+                        Text("No need to hold the key while you talk. Friendlier for long dictations and anyone managing carpal tunnel or RSI.")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -284,6 +294,8 @@ private struct GeneralSection: View {
                     .font(.system(size: 13))
                 Toggle("Sound feedback", isOn: $settings.soundFeedbackEnabled)
                     .font(.system(size: 13))
+                Toggle("Show dictation island", isOn: $settings.islandEnabled)
+                    .font(.system(size: 13))
 
                 // Live dictation (experimental): commit-on-pause phrase typing.
                 // The toggle stores intent immediately; enabling without the
@@ -314,6 +326,21 @@ private struct GeneralSection: View {
                         LaunchAtLoginHelper.setEnabled(newValue)
                     }
             }
+        }
+    }
+
+    private var hotkeyName: String {
+        KeyCodeNames.shortLabel(for: settings.hotkeyKeyCode)
+    }
+
+    private var hotkeyModeSubtitle: String {
+        switch settings.hotkeyMode {
+        case .pushToTalk:
+            return "Hold key to record, release to transcribe"
+        case .toggle:
+            return "Press to start, press to stop. Easier on the wrists"
+        case .hybrid:
+            return "Hold to talk. Double-tap or hold+Space to keep. Tap to finish, Esc to cancel"
         }
     }
 

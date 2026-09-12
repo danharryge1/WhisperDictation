@@ -8,7 +8,13 @@ final class HotkeyMonitor {
     private var retainedSelfPtr: UnsafeMutableRawPointer?
     private let onKeyDown: () -> Void
     private let onKeyUp: () -> Void
+    private let onLatchKeyDown: () -> Void
+    private let onCancelKeyDown: () -> Bool
     private let lock = os_unfair_lock_t.allocate(capacity: 1)
+    private static let spaceKeyCode: CGKeyCode = 49
+    private static let escapeKeyCode: CGKeyCode = 53
+
+    var isRunning: Bool { eventTap != nil }
 
     private var monitoredKeyCode: CGKeyCode {
         CGKeyCode(AppSettings.shared.hotkeyKeyCode)
@@ -20,9 +26,16 @@ final class HotkeyMonitor {
 
     private var isKeyHeld = false
 
-    init(onKeyDown: @escaping () -> Void, onKeyUp: @escaping () -> Void) {
+    init(
+        onKeyDown: @escaping () -> Void,
+        onKeyUp: @escaping () -> Void,
+        onLatchKeyDown: @escaping () -> Void = {},
+        onCancelKeyDown: @escaping () -> Bool = { false }
+    ) {
         self.onKeyDown = onKeyDown
         self.onKeyUp = onKeyUp
+        self.onLatchKeyDown = onLatchKeyDown
+        self.onCancelKeyDown = onCancelKeyDown
         lock.initialize(to: os_unfair_lock())
     }
 
@@ -128,12 +141,12 @@ final class HotkeyMonitor {
                 if isPressed && !wasHeld {
                     isKeyHeld = true
                     os_unfair_lock_unlock(lock)
-                    DispatchQueue.main.async { self.onKeyDown() }
+                    self.emitKeyDown()
                     return nil
                 } else if !isPressed && wasHeld {
                     isKeyHeld = false
                     os_unfair_lock_unlock(lock)
-                    DispatchQueue.main.async { self.onKeyUp() }
+                    self.emitKeyUp()
                     return nil
                 }
                 os_unfair_lock_unlock(lock)
@@ -145,19 +158,48 @@ final class HotkeyMonitor {
                 if type == .keyDown && !wasHeld {
                     isKeyHeld = true
                     os_unfair_lock_unlock(lock)
-                    DispatchQueue.main.async { self.onKeyDown() }
+                    self.emitKeyDown()
                     return nil
                 } else if type == .keyUp && wasHeld {
                     isKeyHeld = false
                     os_unfair_lock_unlock(lock)
-                    DispatchQueue.main.async { self.onKeyUp() }
+                    self.emitKeyUp()
                     return nil
                 }
                 os_unfair_lock_unlock(lock)
             }
         }
 
+        if type == .keyDown && keyCode == Self.spaceKeyCode && keyCode != monitoredKeyCode {
+            let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            os_unfair_lock_lock(lock)
+            let held = isKeyHeld
+            os_unfair_lock_unlock(lock)
+            if held && !isRepeat && AppSettings.shared.hotkeyMode == .hybrid {
+                self.emitOnMain { self.onLatchKeyDown() }
+                return nil
+            }
+        }
+
+        if type == .keyDown && keyCode == Self.escapeKeyCode {
+            let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            if !isRepeat && onCancelKeyDown() {
+                return nil
+            }
+        }
+
         return Unmanaged.passRetained(event)
+    }
+
+    private func emitKeyDown() { emitOnMain(onKeyDown) }
+    private func emitKeyUp() { emitOnMain(onKeyUp) }
+
+    private func emitOnMain(_ body: @escaping () -> Void) {
+        if Thread.isMainThread {
+            body()
+        } else {
+            DispatchQueue.main.async(execute: body)
+        }
     }
 
     private func isModifierPressed(_ flags: CGEventFlags) -> Bool {

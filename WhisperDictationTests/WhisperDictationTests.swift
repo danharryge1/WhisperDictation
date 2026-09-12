@@ -30,6 +30,9 @@ final class AppSettingsTests: XCTestCase {
         settings.hotkeyMode = .toggle
         XCTAssertEqual(settings.hotkeyMode, .toggle)
 
+        settings.hotkeyMode = .hybrid
+        XCTAssertEqual(settings.hotkeyMode, .hybrid)
+
         settings.hotkeyMode = .pushToTalk
         XCTAssertEqual(settings.hotkeyMode, .pushToTalk)
 
@@ -186,6 +189,88 @@ final class LiveDictationSettingTests: XCTestCase {
         XCTAssertTrue(settings.liveDictationEnabled)
         settings.liveDictationEnabled = false
         XCTAssertFalse(settings.liveDictationEnabled)
+    }
+}
+
+// MARK: - Transcript History Tests
+
+final class TranscriptHistoryTests: XCTestCase {
+    private let historyKey = "transcriptHistory"
+    private var savedHistory: Any?
+
+    override func setUp() {
+        super.setUp()
+        savedHistory = UserDefaults.standard.object(forKey: historyKey)
+        UserDefaults.standard.removeObject(forKey: historyKey)
+    }
+
+    override func tearDown() {
+        if let savedHistory {
+            UserDefaults.standard.set(savedHistory, forKey: historyKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: historyKey)
+        }
+        super.tearDown()
+    }
+
+    func testEmptyHistoryStartsEmpty() {
+        XCTAssertTrue(AppSettings.shared.transcriptHistory.isEmpty)
+    }
+
+    func testRecordTranscriptNewestFirst() {
+        let first = TranscriptHistory.recording("first", into: [])
+        let second = TranscriptHistory.recording("second", into: first)
+        XCTAssertEqual(second.map(\.text), ["second", "first"])
+    }
+
+    func testRecordTranscriptSkipsBlank() {
+        XCTAssertTrue(TranscriptHistory.recording("   \n", into: []).isEmpty)
+    }
+
+    func testRecordTranscriptSkipsConsecutiveDuplicate() {
+        let once = TranscriptHistory.recording("same", into: [])
+        let twice = TranscriptHistory.recording("same", into: once)
+        XCTAssertEqual(twice.count, 1)
+    }
+
+    func testRecordTranscriptCapsAtFive() {
+        var items: [TranscriptHistory.Entry] = []
+        for i in 1...7 { items = TranscriptHistory.recording("item \(i)", into: items) }
+        XCTAssertEqual(items.count, TranscriptHistory.maxCount)
+        XCTAssertEqual(items.map(\.text), [
+            "item 7", "item 6", "item 5", "item 4", "item 3"
+        ])
+    }
+
+    func testHistoryPersistsAcrossReads() {
+        AppSettings.shared.recordTranscript("keep me")
+        XCTAssertEqual(AppSettings.shared.transcriptHistory.first?.text, "keep me")
+    }
+}
+
+// MARK: - Island Placement Tests
+
+final class IslandPlacementTests: XCTestCase {
+    func testIslandSitsBottomCentreOfVisibleFrame() {
+        let visible = CGRect(x: 100, y: 50, width: 1440, height: 850)
+        let size = CGSize(width: 148, height: 32)
+        let origin = IslandPlacement.origin(in: visible, size: size)
+        XCTAssertEqual(origin.x, visible.origin.x + (visible.size.width - size.width) / 2)
+        XCTAssertEqual(origin.y, visible.origin.y + IslandPlacement.bottomMargin)
+        XCTAssertEqual(IslandPlacement.bottomMargin, 18)
+    }
+
+    func testHoldDisplayIsLongEnoughToSee() {
+        XCTAssertEqual(DictationEngine.holdDisplayMinimum, 0.15)
+        XCTAssertGreaterThanOrEqual(DictationEngine.holdDisplayMinimum, 0.1)
+    }
+
+    func testFramePickerUsesTheScreenContainingThePoint() {
+        let left = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let right = CGRect(x: 1920, y: 0, width: 2560, height: 1080)
+        XCTAssertEqual(IslandPlacement.frame(containing: CGPoint(x: 900, y: 100), in: [left, right]), left)
+        XCTAssertEqual(IslandPlacement.frame(containing: CGPoint(x: 2500, y: 100), in: [left, right]), right)
+        XCTAssertNil(IslandPlacement.frame(containing: CGPoint(x: -20, y: 100), in: [left, right]))
     }
 }
 
@@ -593,6 +678,150 @@ final class DictationEngineTests: XCTestCase {
         XCTAssertEqual(DictationEngine.toggleHoldAction(state: .typing), .cancelTranscription)
     }
 
+    func testHybridKeyDownDispatchesToHybridHandler() {
+        for state in [DictationState.idle, .recording, .processing, .typing] {
+            XCTAssertEqual(
+                DictationEngine.keyDownAction(mode: .hybrid, state: state),
+                .handleHybrid,
+                "hybrid key-down in \(state) must use the hybrid handler"
+            )
+        }
+    }
+
+    func testHybridPressDuringProcessingStartsFreshPushToTalk() {
+        XCTAssertEqual(
+            DictationEngine.hybridKeyDownAction(state: .processing, kind: .none, awaitingSecondTap: false),
+            .startPushToTalk
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyDownAction(state: .typing, kind: .none, awaitingSecondTap: false),
+            .startPushToTalk
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyDownAction(state: .processing, kind: .none, awaitingSecondTap: true),
+            .startPushToTalk
+        )
+    }
+
+    func testHybridShortReleaseIsDiscardNotLatch() {
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .idle, kind: .pushToTalk, holdTimerWasPending: false,
+                finishPressArmed: false, heldLongEnough: false
+            ),
+            .discardAsTap
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .idle, kind: .pushToTalk, holdTimerWasPending: false,
+                finishPressArmed: false, heldLongEnough: true
+            ),
+            .stopPushToTalk
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .processing, kind: .pushToTalk, holdTimerWasPending: false,
+                finishPressArmed: false, heldLongEnough: true
+            ),
+            .stopPushToTalk
+        )
+    }
+
+    func testHybridPressStartsRecordingImmediately() {
+        XCTAssertEqual(
+            DictationEngine.hybridKeyDownAction(state: .idle, kind: .none, awaitingSecondTap: false),
+            .startPushToTalk
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .idle, kind: .pushToTalk, holdTimerWasPending: false,
+                finishPressArmed: false, heldLongEnough: false
+            ),
+            .discardAsTap
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .recording, kind: .pushToTalk, holdTimerWasPending: false,
+                finishPressArmed: false, heldLongEnough: false
+            ),
+            .discardAsTap
+        )
+    }
+
+    func testHybridDoubleTapStartsAutoHold() {
+        XCTAssertEqual(
+            DictationEngine.hybridKeyDownAction(state: .idle, kind: .none, awaitingSecondTap: true),
+            .startAutoHold
+        )
+    }
+
+    func testHybridHoldReleaseStopsPushToTalkOnly() {
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .recording, kind: .pushToTalk, holdTimerWasPending: false,
+                finishPressArmed: false, heldLongEnough: true
+            ),
+            .stopPushToTalk
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .recording, kind: .autoHold, holdTimerWasPending: false,
+                finishPressArmed: false, heldLongEnough: true
+            ),
+            .none
+        )
+    }
+
+    func testHybridSingleTapFinishesAutoHold() {
+        XCTAssertEqual(
+            DictationEngine.hybridKeyDownAction(state: .recording, kind: .autoHold, awaitingSecondTap: false),
+            .armFinishPress
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .recording, kind: .autoHold, holdTimerWasPending: false,
+                finishPressArmed: true, heldLongEnough: true
+            ),
+            .finishAutoHold
+        )
+    }
+
+    func testHybridLatchSpaceStartsSameAsDoubleTapAndDoesNotStop() {
+        XCTAssertEqual(
+            DictationEngine.hybridLatchAction(state: .idle, kind: .none),
+            .startAutoHold
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridLatchAction(state: .recording, kind: .pushToTalk),
+            .convertToAutoHold
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridLatchAction(state: .recording, kind: .autoHold),
+            .none
+        )
+        XCTAssertEqual(
+            DictationEngine.hybridLatchAction(state: .processing, kind: .none),
+            .none
+        )
+    }
+
+    func testHybridEscapeCancelsWhenBusy() {
+        XCTAssertFalse(DictationEngine.hybridCancelAction(state: .idle))
+        XCTAssertTrue(DictationEngine.hybridCancelAction(state: .recording))
+        XCTAssertTrue(DictationEngine.hybridCancelAction(state: .processing))
+        XCTAssertTrue(DictationEngine.hybridCancelAction(state: .typing))
+    }
+
+    func testHybridHoldDuringAutoHoldDoesNotFinishUntilKeyUpOfNewPress() {
+        XCTAssertEqual(
+            DictationEngine.hybridKeyUpAction(
+                state: .recording, kind: .autoHold, holdTimerWasPending: true,
+                finishPressArmed: false, heldLongEnough: true
+            ),
+            .markTap
+        )
+    }
+
     func testInitialState() {
         let engine = DictationEngine()
         XCTAssertEqual(engine.state, .idle)
@@ -722,6 +951,30 @@ final class AudioCaptureDurationCapTests: XCTestCase {
         // Already past the cap — must NOT fire again (fire-once guarantee).
         XCTAssertFalse(AudioCapture.crossesDurationCap(previousCount: cap, newCount: cap + 500))
         XCTAssertFalse(AudioCapture.crossesDurationCap(previousCount: cap + 500, newCount: cap + 1000))
+    }
+
+    func testRmsEnergyEmptyIsZero() {
+        XCTAssertEqual(AudioCapture.rmsEnergy([]), 0)
+    }
+
+    func testRmsEnergyKnownVector() {
+        XCTAssertEqual(AudioCapture.rmsEnergy([0.5, -0.5]), 0.5, accuracy: 0.0001)
+        XCTAssertEqual(AudioCapture.rmsEnergy([0, 0, 0]), 0)
+        XCTAssertGreaterThan(AudioCapture.rmsEnergy([0.2, 0.1, -0.15]), 0.018)
+        XCTAssertLessThan(AudioCapture.rmsEnergy([0.001, -0.001]), 0.018)
+    }
+
+    func testBarEnergiesEmptyIsZeros() {
+        XCTAssertEqual(AudioCapture.barEnergies([], bars: 4), [0, 0, 0, 0])
+    }
+
+    func testBarEnergiesFollowsLoudThenQuietSlices() {
+        let loud = [Float](repeating: 0.4, count: 8)
+        let quiet = [Float](repeating: 0.01, count: 8)
+        let levels = AudioCapture.barEnergies(loud + quiet, bars: 2)
+        XCTAssertEqual(levels.count, 2)
+        XCTAssertGreaterThan(levels[0], levels[1])
+        XCTAssertEqual(levels[0], AudioCapture.rmsEnergy(loud), accuracy: 0.0001)
     }
 }
 

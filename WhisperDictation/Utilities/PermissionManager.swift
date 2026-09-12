@@ -1,5 +1,6 @@
 import AVFoundation
 import Cocoa
+import ApplicationServices
 
 final class PermissionManager: ObservableObject, @unchecked Sendable {
     static let shared = PermissionManager()
@@ -46,12 +47,32 @@ final class PermissionManager: ObservableObject, @unchecked Sendable {
     // MARK: - Accessibility
 
     func checkAccessibility() {
-        accessibilityGranted = AXIsProcessTrusted()
+        let trusted = AXIsProcessTrusted()
+        if Thread.isMainThread {
+            accessibilityGranted = trusted
+        } else {
+            DispatchQueue.main.async { self.accessibilityGranted = trusted }
+        }
+    }
+
+    /// Shows the system Accessibility prompt. Needed after an ad-hoc re-sign,
+    /// when System Settings can still list the app while AXIsProcessTrusted is false.
+    func promptAccessibilityIfNeeded() {
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        let options = [promptKey: true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        if Thread.isMainThread {
+            accessibilityGranted = trusted
+        } else {
+            DispatchQueue.main.async { self.accessibilityGranted = trusted }
+        }
     }
 
     func openAccessibilitySettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-        NSWorkspace.shared.open(url)
+        promptAccessibilityIfNeeded()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     func openMicrophoneSettings() {

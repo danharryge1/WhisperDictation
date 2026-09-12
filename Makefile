@@ -9,6 +9,8 @@ APP_BUNDLE := $(BUILD_DIR)/WhisperDictation.app
 # what we ship — Apple Silicon and Intel users both need to be able to run it.
 
 SWIFT_FILES := \
+	WhisperDictation/Utilities/TranscriptHistory.swift \
+	WhisperDictation/Utilities/IslandPlacement.swift \
 	WhisperDictation/Utilities/Settings.swift \
 	WhisperDictation/Utilities/KeyCodeNames.swift \
 	WhisperDictation/Utilities/AppInfo.swift \
@@ -27,6 +29,7 @@ SWIFT_FILES := \
 	WhisperDictation/UI/MenuBarView.swift \
 	WhisperDictation/UI/SettingsView.swift \
 	WhisperDictation/UI/OnboardingView.swift \
+	WhisperDictation/UI/IslandOverlay.swift \
 	WhisperDictation/App/WhisperDictationApp.swift
 
 LIBS := -lwhisper -lggml -lggml-base -lggml-cpu -lggml-metal -lggml-blas -lc++
@@ -64,8 +67,8 @@ $(BUILD_DIR)/WhisperDictation-x86_64: $(SWIFT_FILES) lib/libwhisper.a
 	@mkdir -p $(BUILD_DIR)
 	$(call BUILD_SLICE,x86_64)
 
-$(BUILD_DIR)/WhisperDictation: $(BUILD_DIR)/WhisperDictation-arm64 $(BUILD_DIR)/WhisperDictation-x86_64
-	lipo -create $^ -output $@
+$(BUILD_DIR)/WhisperDictation: $(BUILD_DIR)/WhisperDictation-arm64
+	cp $< $@
 	@lipo -info $@
 
 app: $(BUILD_DIR)/WhisperDictation

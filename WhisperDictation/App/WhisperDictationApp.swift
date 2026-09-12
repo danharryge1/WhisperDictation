@@ -12,6 +12,9 @@ struct WhisperDictationApp: App {
             // place to trigger first-launch onboarding for an LSUIElement app that has
             // no window open at startup.
             MenuBarLabel(engine: engine)
+                .task {
+                    IslandController.shared.attach(engine: engine)
+                }
         }
         .menuBarExtraStyle(.window)
 

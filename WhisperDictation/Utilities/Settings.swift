@@ -7,7 +7,7 @@ final class AppSettings: ObservableObject, @unchecked Sendable {
 
     // MARK: - Hotkey Mode
 
-    enum HotkeyMode: String { case pushToTalk, toggle }
+    enum HotkeyMode: String { case pushToTalk, toggle, hybrid }
 
     // MARK: - Keys
 
@@ -26,7 +26,13 @@ final class AppSettings: ObservableObject, @unchecked Sendable {
         case customTerms
         case hasCompletedOnboarding
         case liveDictationEnabled
+        case islandEnabled
+        case transcriptHistory
     }
+
+    typealias TranscriptEntry = TranscriptHistory.Entry
+
+    static let maxTranscriptHistory = TranscriptHistory.maxCount
 
     // MARK: - Properties
 
@@ -121,6 +127,32 @@ final class AppSettings: ObservableObject, @unchecked Sendable {
     var liveDictationEnabled: Bool {
         get { defaults.bool(forKey: Key.liveDictationEnabled.rawValue) }
         set { defaults.set(newValue, forKey: Key.liveDictationEnabled.rawValue); objectWillChange.send() }
+    }
+
+    var islandEnabled: Bool {
+        get { defaults.object(forKey: Key.islandEnabled.rawValue) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.islandEnabled.rawValue); objectWillChange.send() }
+    }
+
+    var transcriptHistory: [TranscriptEntry] {
+        get {
+            guard let data = defaults.data(forKey: Key.transcriptHistory.rawValue),
+                  let items = try? JSONDecoder().decode([TranscriptEntry].self, from: data) else {
+                return []
+            }
+            return Array(items.prefix(Self.maxTranscriptHistory))
+        }
+        set {
+            let capped = Array(newValue.prefix(Self.maxTranscriptHistory))
+            if let data = try? JSONEncoder().encode(capped) {
+                defaults.set(data, forKey: Key.transcriptHistory.rawValue)
+            }
+            objectWillChange.send()
+        }
+    }
+
+    func recordTranscript(_ text: String) {
+        transcriptHistory = TranscriptHistory.recording(text, into: transcriptHistory)
     }
 
     /// Maximum number of custom vocabulary terms. Mirrors the UI cap; enforced here

@@ -22,8 +22,29 @@ final class DictationEngine {
     private(set) var transcriptionError: String?
 
     /// True while the user is holding the hotkey but the toggle-mode threshold hasn't yet fired.
-    /// Drives the menu bar hold indicator.
+    /// Also true in the sliver after key-down before the mic is actually live.
+    /// Drives the orange Hold island.
     private(set) var isHoldingForToggle: Bool = false
+
+    /// Smoothed per-bar mic energy while recording. Drives the live island meter.
+    private(set) var inputLevels: [Float] = Array(repeating: 0, count: AudioCapture.visualizerBars)
+
+    var isAutoHoldRecording: Bool { hybridKind == .autoHold && state == .recording }
+
+    func requestFinish() {
+        guard state == .recording else { return }
+        stopRecordingAndTranscribe()
+    }
+
+    /// Keep the last utterance, persist it for recovery, and put it on the
+    /// clipboard so Cmd+V works when there was no text field to type into.
+    private func commitTranscript(_ text: String) {
+        lastTranscription = text
+        transcriptionError = nil
+        AppSettings.shared.recordTranscript(text)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
 
     private var whisperBridge: WhisperBridge?
     private let audioCapture = AudioCapture()
@@ -33,12 +54,36 @@ final class DictationEngine {
 
     private let minRecordingDuration: TimeInterval = 0.3
     private var recordingStartTime: Date?
+    private var holdAppearedAt: Date?
+    private var startClickPlayed = false
+    private var goLiveWorkItem: DispatchWorkItem?
+    private var isArmingCapture = false
+    private var captureGeneration = 0
+    private var hybridPressedAt: Date?
+    private var pendingStopAfterArm = false
+    private var skipNextStopSound = false
 
     private var accessibilityPoller: Timer?
 
     /// Pending toggle-mode hold timer. Cancelled if the user releases the key
     /// before the threshold; cleared after firing.
     private var holdWorkItem: DispatchWorkItem?
+
+    /// Hybrid mode: hold = push-to-talk, double-tap or hold+Space = auto-hold.
+    private var hybridKind: HybridRecordingKind = .none
+    private var hybridHotkeyDown = false
+    private var hybridAwaitingSecondTap = false
+    private var hybridHoldWorkItem: DispatchWorkItem?
+    private var hybridTapWorkItem: DispatchWorkItem?
+    private var hybridFinishPressArmed = false
+
+    /// After an instant start, a release shorter than this is discarded rather
+    /// than transcribed. Fn+Space still latches auto-hold.
+    static let hybridHoldThreshold: TimeInterval = 0.18
+    static let hybridDoubleTapWindow: TimeInterval = 0.40
+    static let holdDisplayMinimum: TimeInterval = 0.15
+
+    enum HybridRecordingKind: Equatable { case none, pushToTalk, autoHold }
 
     init() {
         let axTrusted = AXIsProcessTrusted()
@@ -48,6 +93,24 @@ final class DictationEngine {
         }
         audioCapture.onMaxDurationReached = { [weak self] in
             self?.handleMaxRecordingDurationReached()
+        }
+        audioCapture.onBarLevels = { [weak self] levels in
+            DispatchQueue.main.async {
+                guard let self, self.state == .recording, !self.isHoldingForToggle else { return }
+                var next = self.inputLevels
+                if next.count != AudioCapture.visualizerBars {
+                    next = Array(repeating: 0, count: AudioCapture.visualizerBars)
+                }
+                for i in 0..<AudioCapture.visualizerBars {
+                    let incoming = i < levels.count ? levels[i] : 0
+                    if incoming > next[i] {
+                        next[i] = incoming
+                    } else {
+                        next[i] = next[i] * 0.48 + incoming * 0.52
+                    }
+                }
+                self.inputLevels = next
+            }
         }
         setupHotkeyMonitor()
         hotkeyMonitor?.start()
@@ -69,18 +132,24 @@ final class DictationEngine {
         }
 
         if !axTrusted {
-            startAccessibilityPoller()
+            PermissionManager.shared.promptAccessibilityIfNeeded()
         }
+        startAccessibilityPoller()
     }
 
     private func startAccessibilityPoller() {
         accessibilityPoller?.invalidate()
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] timer in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            PermissionManager.shared.checkPermissions()
+            guard let self else { return }
             if AXIsProcessTrusted() {
-                fputs("[DictationEngine] Accessibility granted! Restarting hotkey monitor.\n", stderr)
-                timer.invalidate()
-                self?.accessibilityPoller = nil
-                self?.restartHotkeyMonitor()
+                if self.hotkeyMonitor?.isRunning != true {
+                    fputs("[DictationEngine] Accessibility granted. Starting hotkey monitor.\n", stderr)
+                    self.restartHotkeyMonitor()
+                }
+            } else if self.hotkeyMonitor?.isRunning == true {
+                fputs("[DictationEngine] Accessibility lost. Stopping hotkey monitor.\n", stderr)
+                self.hotkeyMonitor?.stop()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -156,7 +225,19 @@ final class DictationEngine {
     /// busy, perform it now. Main-actor only.
     private func returnToIdle() {
         state = .idle
+        inputLevels = Array(repeating: 0, count: AudioCapture.visualizerBars)
+        isHoldingForToggle = false
+        isArmingCapture = false
+        holdAppearedAt = nil
+        startClickPlayed = false
+        pendingStopAfterArm = false
+        skipNextStopSound = false
+        hybridPressedAt = nil
+        goLiveWorkItem?.cancel()
+        goLiveWorkItem = nil
+        IslandController.shared.setVisible(false)
         drainCancelFlag = nil
+        hybridKind = .none
         if pendingModelReload { performModelReload() }
     }
 
@@ -165,7 +246,9 @@ final class DictationEngine {
     private func setupHotkeyMonitor() {
         hotkeyMonitor = HotkeyMonitor(
             onKeyDown: { [weak self] in self?.handleKeyDown() },
-            onKeyUp: { [weak self] in self?.handleKeyUp() }
+            onKeyUp: { [weak self] in self?.handleKeyUp() },
+            onLatchKeyDown: { [weak self] in self?.handleLatchKeyDown() },
+            onCancelKeyDown: { [weak self] in self?.handleCancelKeyDown() ?? false }
         )
     }
 
@@ -195,7 +278,7 @@ final class DictationEngine {
     ///   the user taps to "stop", and the tap lands during .processing). So toggle
     ///   always goes through `scheduleToggleAction`; the cancel happens only if the
     ///   full hold completes while transcribing (see `toggleHoldAction`).
-    enum KeyDownAction: Equatable { case startRecording, scheduleToggle, cancelTranscription }
+    enum KeyDownAction: Equatable { case startRecording, scheduleToggle, cancelTranscription, handleHybrid }
 
     static func keyDownAction(mode: AppSettings.HotkeyMode, state: DictationState) -> KeyDownAction {
         switch mode {
@@ -203,6 +286,8 @@ final class DictationEngine {
             return (state == .processing || state == .typing) ? .cancelTranscription : .startRecording
         case .toggle:
             return .scheduleToggle
+        case .hybrid:
+            return .handleHybrid
         }
     }
 
@@ -228,6 +313,8 @@ final class DictationEngine {
             startRecording()
         case .scheduleToggle:
             scheduleToggleAction()
+        case .handleHybrid:
+            handleHybridKeyDown()
         }
     }
 
@@ -255,7 +342,253 @@ final class DictationEngine {
             stopRecordingAndTranscribe()
         case .toggle:
             cancelPendingToggle()
+        case .hybrid:
+            handleHybridKeyUp()
         }
+    }
+
+    private func handleLatchKeyDown() {
+        guard AppSettings.shared.hotkeyMode == .hybrid else { return }
+        handleHybridLatch()
+    }
+
+    enum HybridKeyDownAction: Equatable {
+        case startPushToTalk, startAutoHold, armFinishPress, cancelTranscription, none
+    }
+
+    static func hybridKeyDownAction(
+        state: DictationState,
+        kind: HybridRecordingKind,
+        awaitingSecondTap: Bool
+    ) -> HybridKeyDownAction {
+        if awaitingSecondTap {
+            switch state {
+            case .idle: return .startAutoHold
+            case .recording: return kind == .autoHold ? .armFinishPress : .none
+            case .processing, .typing: return .startPushToTalk
+            }
+        }
+        switch state {
+        case .idle: return .startPushToTalk
+        case .processing, .typing: return .startPushToTalk
+        case .recording: return kind == .autoHold ? .armFinishPress : .none
+        }
+    }
+
+    enum HybridKeyUpAction: Equatable { case stopPushToTalk, finishAutoHold, discardAsTap, markTap, none }
+
+    static func hybridKeyUpAction(
+        state: DictationState,
+        kind: HybridRecordingKind,
+        holdTimerWasPending: Bool,
+        finishPressArmed: Bool,
+        heldLongEnough: Bool
+    ) -> HybridKeyUpAction {
+        if kind == .pushToTalk {
+            return heldLongEnough ? .stopPushToTalk : .discardAsTap
+        }
+        if kind == .autoHold && state == .recording && finishPressArmed { return .finishAutoHold }
+        if holdTimerWasPending { return .markTap }
+        return .none
+    }
+
+    enum HybridLatchAction: Equatable {
+        case startAutoHold, convertToAutoHold, none
+    }
+
+    static func hybridLatchAction(
+        state: DictationState,
+        kind: HybridRecordingKind
+    ) -> HybridLatchAction {
+        switch state {
+        case .idle: return .startAutoHold
+        case .recording: return kind == .autoHold ? .none : .convertToAutoHold
+        case .processing, .typing: return .none
+        }
+    }
+
+    static func hybridCancelAction(state: DictationState) -> Bool {
+        state != .idle
+    }
+
+    private func handleHybridKeyDown() {
+        hybridHotkeyDown = true
+        hybridPressedAt = Date()
+        pendingStopAfterArm = false
+        switch Self.hybridKeyDownAction(state: state, kind: hybridKind, awaitingSecondTap: hybridAwaitingSecondTap) {
+        case .startPushToTalk:
+            hybridAwaitingSecondTap = false
+            hybridFinishPressArmed = false
+            cancelHybridTapWindow()
+            cancelHybridHoldTimer()
+            startHybridRecording(.pushToTalk)
+        case .startAutoHold:
+            cancelHybridHoldTimer()
+            hybridAwaitingSecondTap = false
+            hybridFinishPressArmed = false
+            startHybridRecording(.autoHold)
+        case .armFinishPress:
+            cancelHybridHoldTimer()
+            hybridAwaitingSecondTap = false
+            hybridFinishPressArmed = true
+        case .cancelTranscription:
+            cancelHybridHoldTimer()
+            hybridAwaitingSecondTap = false
+            hybridFinishPressArmed = false
+            cancelSession()
+        case .none:
+            break
+        }
+    }
+
+    private func handleHybridKeyUp() {
+        hybridHotkeyDown = false
+        let holdWasPending = hybridHoldWorkItem != nil
+        let finishArmed = hybridFinishPressArmed
+        hybridFinishPressArmed = false
+        cancelHybridHoldTimer()
+        let heldLongEnough: Bool = {
+            guard let start = hybridPressedAt else { return false }
+            return Date().timeIntervalSince(start) >= Self.hybridHoldThreshold
+        }()
+        switch Self.hybridKeyUpAction(
+            state: state,
+            kind: hybridKind,
+            holdTimerWasPending: holdWasPending,
+            finishPressArmed: finishArmed,
+            heldLongEnough: heldLongEnough
+        ) {
+        case .stopPushToTalk, .finishAutoHold:
+            if state == .recording {
+                stopRecordingAndTranscribe()
+            } else {
+                pendingStopAfterArm = true
+                skipNextStopSound = true
+                soundFeedback.playStopSound()
+            }
+        case .discardAsTap:
+            discardRecordingForTap()
+        case .markTap:
+            hybridAwaitingSecondTap = true
+            scheduleHybridTapWindow()
+        case .none:
+            break
+        }
+    }
+
+    private func handleHybridLatch() {
+        guard hybridHotkeyDown else { return }
+        switch Self.hybridLatchAction(state: state, kind: hybridKind) {
+        case .startAutoHold:
+            cancelHybridHoldTimer()
+            hybridAwaitingSecondTap = false
+            hybridFinishPressArmed = false
+            if isArmingCapture || state == .recording {
+                hybridKind = .autoHold
+            } else {
+                startHybridRecording(.autoHold)
+            }
+        case .convertToAutoHold:
+            hybridKind = .autoHold
+            hybridFinishPressArmed = false
+        case .none:
+            break
+        }
+    }
+
+    @discardableResult
+    private func handleCancelKeyDown() -> Bool {
+        guard Self.hybridCancelAction(state: state) || isArmingCapture else { return false }
+        cancelSession()
+        return true
+    }
+
+    /// Drop the current recording or in-flight transcription without typing more text.
+    private func cancelSession() {
+        cancelHybridHoldTimer()
+        cancelHybridTapWindow()
+        hybridAwaitingSecondTap = false
+        hybridFinishPressArmed = false
+        hybridHotkeyDown = false
+        guard isArmingCapture || state != .idle else { return }
+        fputs("[DictationEngine] Session cancelled during \(state.rawValue).\n", stderr)
+        soundFeedback.playStopSound()
+        abortCapture()
+        returnToIdle()
+    }
+
+    /// Drop in-flight capture or transcription without hiding the island.
+    /// Bumps `captureGeneration` so delayed go-live / finish work is a no-op.
+    private func abortCapture() {
+        captureGeneration += 1
+        goLiveWorkItem?.cancel()
+        goLiveWorkItem = nil
+        pendingStopAfterArm = false
+        stopCaptureHardware()
+        isArmingCapture = false
+        recordingStartTime = nil
+    }
+
+    private func stopCaptureHardware() {
+        audioCapture.onSamples = nil
+        if audioCapture.isRecording { _ = audioCapture.stopRecording() }
+        liveSessionFlag?.cancel()
+        teardownLiveSession()
+        whisperBridge?.cancelTranscription()
+        drainCancelFlag?.cancel()
+        drainCancelFlag = nil
+    }
+
+    private func startHybridRecording(_ kind: HybridRecordingKind) {
+        hybridKind = kind
+        startRecording()
+    }
+
+    /// Instant Hold island plus the press click, before any audio work.
+    private func showIslandImmediately() {
+        isHoldingForToggle = true
+        holdAppearedAt = Date()
+        IslandController.shared.revealHold()
+        if !startClickPlayed {
+            startClickPlayed = true
+            soundFeedback.playStartSound()
+        }
+        IslandController.shared.flushPresentation()
+    }
+
+    private func finishHoldAndGoLive() {
+        guard state == .recording else { return }
+        isHoldingForToggle = false
+        IslandController.shared.revealLive()
+    }
+
+    /// First half of a double-tap: drop the instant-start capture without
+    /// transcribing. A new press is a fresh PTT, not a latch.
+    private func discardRecordingForTap() {
+        soundFeedback.playStopSound()
+        abortCapture()
+        returnToIdle()
+    }
+
+    private func scheduleHybridTapWindow() {
+        cancelHybridTapWindow()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.hybridTapWorkItem = nil
+            self.hybridAwaitingSecondTap = false
+        }
+        hybridTapWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.hybridDoubleTapWindow, execute: work)
+    }
+
+    private func cancelHybridHoldTimer() {
+        hybridHoldWorkItem?.cancel()
+        hybridHoldWorkItem = nil
+    }
+
+    private func cancelHybridTapWindow() {
+        hybridTapWorkItem?.cancel()
+        hybridTapWorkItem = nil
     }
 
     /// Toggle mode: schedule a deferred start/stop after `toggleHoldDuration` seconds.
@@ -263,6 +596,7 @@ final class DictationEngine {
     private func scheduleToggleAction() {
         cancelPendingToggle()
         isHoldingForToggle = true
+        IslandController.shared.revealHold()
         // Capture the duration ONCE at schedule time. We pass this same value to the
         // trim path so the audio trimmed at stop matches what was actually waited out,
         // even if the slider value changes between schedule and stop.
@@ -287,9 +621,18 @@ final class DictationEngine {
     }
 
     private func cancelPendingToggle() {
+        let wasHolding = isHoldingForToggle
         holdWorkItem?.cancel()
         holdWorkItem = nil
         if isHoldingForToggle { isHoldingForToggle = false }
+        cancelHybridHoldTimer()
+        cancelHybridTapWindow()
+        hybridHotkeyDown = false
+        hybridAwaitingSecondTap = false
+        hybridFinishPressArmed = false
+        if wasHolding, state == .idle {
+            IslandController.shared.setVisible(false)
+        }
     }
 
     // MARK: - Prompt Assembly
@@ -332,22 +675,64 @@ final class DictationEngine {
     // MARK: - Recording Flow
 
     private func startRecording() {
-        guard state == .idle, isModelLoaded else { return }
+        guard isModelLoaded else { return }
+        showIslandImmediately()
 
+        captureGeneration += 1
+        goLiveWorkItem?.cancel()
+        goLiveWorkItem = nil
         transcriptionError = nil
-        state = .recording
-        recordingStartTime = Date()
-        soundFeedback.playStartSound()
+        inputLevels = Array(repeating: 0, count: AudioCapture.visualizerBars)
+        isArmingCapture = true
+        recordingStartTime = nil
+        let generation = captureGeneration
 
-        let live = startLiveSessionIfEnabled()
-        fputs("[DictationEngine] Recording (live: \(live))\n", stderr)
+        DispatchQueue.main.async { [weak self] in
+            self?.armCapture(generation: generation)
+        }
+    }
+
+    private func armCapture(generation: Int) {
+        guard generation == captureGeneration, isArmingCapture else { return }
+        stopCaptureHardware()
 
         do {
             try audioCapture.startRecording()
         } catch {
             fputs("[DictationEngine] Failed to start recording: \(error)\n", stderr)
             teardownLiveSession()
-            state = .idle
+            hybridKind = .none
+            if generation == captureGeneration { returnToIdle() }
+            return
+        }
+        guard generation == captureGeneration, isArmingCapture else {
+            if audioCapture.isRecording { _ = audioCapture.stopRecording() }
+            return
+        }
+        isArmingCapture = false
+        state = .recording
+        recordingStartTime = Date()
+        let live = startLiveSessionIfEnabled()
+        fputs("[DictationEngine] Recording (live: \(live))\n", stderr)
+
+        if pendingStopAfterArm {
+            pendingStopAfterArm = false
+            stopRecordingAndTranscribe()
+            return
+        }
+
+        let shown = holdAppearedAt ?? Date()
+        let remaining = Self.holdDisplayMinimum - Date().timeIntervalSince(shown)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, generation == self.captureGeneration else { return }
+            self.goLiveWorkItem = nil
+            self.finishHoldAndGoLive()
+        }
+        goLiveWorkItem = work
+        if remaining > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining, execute: work)
+        } else {
+            work.perform()
         }
     }
 
@@ -357,13 +742,22 @@ final class DictationEngine {
     ///   Push-to-talk passes 0.
     private func stopRecordingAndTranscribe(trimTrailingSeconds: TimeInterval = 0) {
         guard state == .recording else { return }
+        goLiveWorkItem?.cancel()
+        goLiveWorkItem = nil
+        isHoldingForToggle = false
+        IslandController.shared.revealLive()
+        if skipNextStopSound {
+            skipNextStopSound = false
+        } else {
+            soundFeedback.playStopSound()
+        }
+        let generation = captureGeneration
         if isLiveSession {
             stopLiveSession(trimTrailingSeconds: trimTrailingSeconds)
             return
         }
 
         let audioBuffer = audioCapture.stopRecording(trimTrailingSeconds: trimTrailingSeconds)
-        soundFeedback.playStopSound()
 
         // Check minimum duration
         if let start = recordingStartTime,
@@ -395,13 +789,13 @@ final class DictationEngine {
             func finish(transcript: String?, error: String?) async {
                 injector.flush()
                 await MainActor.run { [weak self] in
-                    if let error { self?.transcriptionError = error }
+                    guard let self, self.captureGeneration == generation else { return }
                     if let transcript, !transcript.isEmpty {
-                        self?.lastTranscription = transcript
-                        self?.transcriptionError = nil
+                        self.commitTranscript(transcript)
                     }
+                    if let error { self.transcriptionError = error }
                     feedback.playDoneSound()
-                    self?.returnToIdle()
+                    self.returnToIdle()
                 }
             }
 
@@ -411,7 +805,8 @@ final class DictationEngine {
             }
 
             await MainActor.run { [weak self] in
-                self?.state = .typing
+                guard let self, self.captureGeneration == generation else { return }
+                self.state = .typing
             }
 
             // Stream: correct and type each segment as it's decoded. Segments are
@@ -427,14 +822,12 @@ final class DictationEngine {
                     injector.type(text: collected.joinAndAppend(corrected))
                 }
             } catch let error as WhisperError where error.isCancellation {
-                // User-intended cancel: reset to idle without surfacing an error.
-                // Any segments already decoded were already typed — that's acceptable.
                 fputs("[DictationEngine] Transcription cancelled by user.\n", stderr)
-                await finish(transcript: nil, error: nil)
+                await finish(transcript: collected.text.isEmpty ? nil : collected.text, error: nil)
                 return
             } catch {
                 fputs("[DictationEngine] Transcription failed: \(error)\n", stderr)
-                await finish(transcript: nil, error: error.localizedDescription)
+                await finish(transcript: collected.text.isEmpty ? nil : collected.text, error: error.localizedDescription)
                 return
             }
 
@@ -527,6 +920,7 @@ final class DictationEngine {
         let injector = self.textInjector
         let feedback = self.soundFeedback
         let collected = TranscriptCollector()
+        let generation = captureGeneration
 
         Task.detached(priority: .userInitiated) { [weak self] in
             var surfacedError: String?
@@ -579,15 +973,13 @@ final class DictationEngine {
 
             let finalError = surfacedError
             await MainActor.run { [weak self] in
-                guard let self else { return }
-                if let finalError {
-                    self.transcriptionError = finalError
-                } else if !collected.text.isEmpty {
+                guard let self, self.captureGeneration == generation else { return }
+                if !collected.text.isEmpty {
                     var transcript = collected.text
                     if Self.needsTerminalPeriod(committed: transcript) { transcript += "." }
-                    self.lastTranscription = transcript
-                    self.transcriptionError = nil
+                    self.commitTranscript(transcript)
                 }
+                if let finalError { self.transcriptionError = finalError }
                 feedback.playDoneSound()
                 self.returnToIdle()
             }
@@ -601,7 +993,6 @@ final class DictationEngine {
     private func stopLiveSession(trimTrailingSeconds: TimeInterval) {
         audioCapture.onSamples = nil
         _ = audioCapture.stopRecording()   // tap removed; buffer intentionally discarded
-        soundFeedback.playStopSound()
         recordingStartTime = nil
 
         var residual = liveSegmenter?.finishAndCollectResidual() ?? []

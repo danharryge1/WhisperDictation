@@ -1,14 +1,14 @@
 import AppKit
 
 final class SoundFeedback {
-    private var startSound: NSSound?
-    private var stopSound: NSSound?
+    private var clickA: NSSound?
+    private var clickB: NSSound?
     private var doneSound: NSSound?
+    private var useA = true
 
     init() {
-        // Use system sounds for now — can be replaced with custom sounds later
-        startSound = NSSound(named: "Tink")
-        stopSound = NSSound(named: "Pop")
+        clickA = NSSound(named: "Tink")
+        clickB = NSSound(named: "Tink")
         doneSound = NSSound(named: "Purr")
     }
 
@@ -17,20 +17,23 @@ final class SoundFeedback {
     }
 
     func playStartSound() {
-        guard isEnabled else { return }
-        startSound?.stop()
-        startSound?.play()
+        playClickSound()
     }
 
     func playStopSound() {
-        guard isEnabled else { return }
-        stopSound?.stop()
-        stopSound?.play()
+        playClickSound()
     }
 
     func playDoneSound() {
         guard isEnabled else { return }
         doneSound?.stop()
         doneSound?.play()
+    }
+
+    private func playClickSound() {
+        guard isEnabled else { return }
+        let sound = useA ? clickA : clickB
+        useA.toggle()
+        sound?.play()
     }
 }

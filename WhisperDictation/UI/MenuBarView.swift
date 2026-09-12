@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct MenuBarView: View {
     let engine: DictationEngine
@@ -22,9 +23,9 @@ struct MenuBarView: View {
                     .padding(.bottom, 10)
             }
 
-            // Last transcription
-            if !engine.lastTranscription.isEmpty {
-                transcriptionSection
+            // Recent transcriptions
+            if !settings.transcriptHistory.isEmpty {
+                historySection
                     .padding(.horizontal, 16)
                     .padding(.bottom, 10)
             }
@@ -117,7 +118,7 @@ struct MenuBarView: View {
                 }
             }
             if !permissions.accessibilityGranted {
-                AlertRow(icon: "hand.raised.fill", text: "Accessibility access needed", color: .orange) {
+                AlertRow(icon: "hand.raised.fill", text: "Accessibility needs a fresh grant after the update", color: .orange) {
                     permissions.openAccessibilitySettings()
                 }
             }
@@ -144,26 +145,19 @@ struct MenuBarView: View {
         }
     }
 
-    // MARK: - Last Transcription
+    // MARK: - Transcript History
 
-    private var transcriptionSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Last transcription")
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Recent")
                 .font(.system(size: 9, weight: .semibold))
                 .textCase(.uppercase)
                 .tracking(0.3)
                 .foregroundStyle(.tertiary)
 
-            Text(engine.lastTranscription)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(.quaternary.opacity(0.5))
-                )
+            ForEach(settings.transcriptHistory) { entry in
+                HistoryRow(entry: entry)
+            }
         }
     }
 
@@ -180,10 +174,22 @@ struct MenuBarView: View {
 
     private var statusText: String {
         switch engine.state {
-        case .idle: engine.isModelLoaded ? "Ready — hold \(hotkeyLabel) to dictate" : "Loading model..."
-        case .recording: "Listening..."
-        case .processing: "Transcribing..."
-        case .typing: "Typing..."
+        case .idle:
+            if !engine.isModelLoaded { return "Loading model..." }
+            switch settings.hotkeyMode {
+            case .pushToTalk:
+                return "Ready: hold \(hotkeyLabel) to dictate"
+            case .toggle:
+                return "Ready: hold \(hotkeyLabel) to start/stop"
+            case .hybrid:
+                return "Ready: hold \(hotkeyLabel), double-tap or \(hotkeyLabel)+Space to keep"
+            }
+        case .recording:
+            return "Listening..."
+        case .processing:
+            return "Transcribing..."
+        case .typing:
+            return "Typing..."
         }
     }
 
@@ -216,6 +222,40 @@ struct MenuBarView: View {
 
     private var hotkeyLabel: String {
         KeyCodeNames.shortLabel(for: settings.hotkeyKeyCode)
+    }
+}
+
+private struct HistoryRow: View {
+    let entry: AppSettings.TranscriptEntry
+    @State private var copied = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(entry.text)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(entry.text, forType: .string)
+                copied = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(copied ? .green : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Copy")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(.quaternary.opacity(0.5))
+        )
     }
 }
 
