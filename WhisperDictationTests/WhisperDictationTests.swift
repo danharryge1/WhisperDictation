@@ -976,6 +976,29 @@ final class AudioCaptureDurationCapTests: XCTestCase {
         XCTAssertGreaterThan(levels[0], levels[1])
         XCTAssertEqual(levels[0], AudioCapture.rmsEnergy(loud), accuracy: 0.0001)
     }
+
+    func testHasSpeechRejectsSilenceAndTinyBuffers() {
+        XCTAssertFalse(AudioCapture.hasSpeech([]))
+        XCTAssertFalse(AudioCapture.hasSpeech([Float](repeating: 0, count: 8000)))
+        XCTAssertFalse(AudioCapture.hasSpeech([Float](repeating: 0.001, count: 8000)))
+        XCTAssertFalse(AudioCapture.hasSpeech([0.4, -0.4]))
+    }
+
+    func testHasSpeechAcceptsAudibleBurst() {
+        var samples = [Float](repeating: 0.001, count: 4000)
+        for i in 0..<400 { samples[i] = (i % 2 == 0) ? 0.2 : -0.2 }
+        XCTAssertTrue(AudioCapture.hasSpeech(samples))
+    }
+
+    func testHasSpeechAcceptsQuietVoice() {
+        XCTAssertTrue(AudioCapture.hasSpeech([Float](repeating: 0.02, count: 4000)))
+    }
+
+    func testTrailingSpeechKeepsAQuietEnding() {
+        XCTAssertFalse(AudioCapture.hasSpeech([Float](repeating: 0.009, count: 4000)))
+        XCTAssertTrue(AudioCapture.hasTrailingSpeech([Float](repeating: 0.009, count: 4000)))
+        XCTAssertFalse(AudioCapture.hasTrailingSpeech([Float](repeating: 0.009, count: 800)))
+    }
 }
 
 final class AudioCaptureConfigChangeTests: XCTestCase {

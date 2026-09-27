@@ -39,7 +39,7 @@ struct MenuBarView: View {
                     openWindow(id: "settings")
                     NSApp.activate(ignoringOtherApps: true)
                 }
-                MenuButton(title: "Quit WhisperDictation", icon: "power", shortcut: "Q") {
+                MenuButton(title: "Quit Dan's Whisper Flow", icon: "power", shortcut: "Q") {
                     NSApplication.shared.terminate(nil)
                 }
             }
@@ -79,7 +79,7 @@ struct MenuBarView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
-                    Text("WhisperDictation")
+                    Text("Dan's Whisper Flow")
                         .font(.system(size: 13, weight: .semibold))
                         .lineLimit(1)
                     // Model badge — short friendly name

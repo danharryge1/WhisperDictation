@@ -54,6 +54,7 @@ final class DictationEngine {
 
     private let minRecordingDuration: TimeInterval = 0.3
     private var recordingStartTime: Date?
+    private var captureRequestedAt: Date?
     private var holdAppearedAt: Date?
     private var startClickPlayed = false
     private var goLiveWorkItem: DispatchWorkItem?
@@ -62,6 +63,11 @@ final class DictationEngine {
     private var hybridPressedAt: Date?
     private var pendingStopAfterArm = false
     private var skipNextStopSound = false
+    private let liveChunkLock = NSLock()
+    private var liveChunksCommitted = 0
+    /// Full mic buffer kept at release. Used only when the live pass produced
+    /// no text, so a real note is not thrown away with the VAD pieces.
+    private var liveFallbackAudio: [Float] = []
 
     private var accessibilityPoller: Timer?
 
@@ -233,11 +239,13 @@ final class DictationEngine {
         pendingStopAfterArm = false
         skipNextStopSound = false
         hybridPressedAt = nil
+        captureRequestedAt = nil
         goLiveWorkItem?.cancel()
         goLiveWorkItem = nil
         IslandController.shared.setVisible(false)
         drainCancelFlag = nil
         hybridKind = .none
+        liveFallbackAudio = []
         if pendingModelReload { performModelReload() }
     }
 
@@ -339,7 +347,13 @@ final class DictationEngine {
     private func handleKeyUp() {
         switch AppSettings.shared.hotkeyMode {
         case .pushToTalk:
-            stopRecordingAndTranscribe()
+            if state == .recording {
+                stopRecordingAndTranscribe()
+            } else if isArmingCapture {
+                pendingStopAfterArm = true
+                skipNextStopSound = true
+                soundFeedback.playStopSound()
+            }
         case .toggle:
             cancelPendingToggle()
         case .hybrid:
@@ -525,6 +539,7 @@ final class DictationEngine {
         goLiveWorkItem = nil
         pendingStopAfterArm = false
         stopCaptureHardware()
+        liveFallbackAudio = []
         isArmingCapture = false
         recordingStartTime = nil
     }
@@ -563,11 +578,13 @@ final class DictationEngine {
     }
 
     /// First half of a double-tap: drop the instant-start capture without
-    /// transcribing. A new press is a fresh PTT, not a latch.
+    /// transcribing, then wait briefly for the second tap.
     private func discardRecordingForTap() {
         soundFeedback.playStopSound()
         abortCapture()
         returnToIdle()
+        hybridAwaitingSecondTap = true
+        scheduleHybridTapWindow()
     }
 
     private func scheduleHybridTapWindow() {
@@ -685,6 +702,7 @@ final class DictationEngine {
         inputLevels = Array(repeating: 0, count: AudioCapture.visualizerBars)
         isArmingCapture = true
         recordingStartTime = nil
+        captureRequestedAt = Date()
         let generation = captureGeneration
 
         DispatchQueue.main.async { [weak self] in
@@ -745,7 +763,6 @@ final class DictationEngine {
         goLiveWorkItem?.cancel()
         goLiveWorkItem = nil
         isHoldingForToggle = false
-        IslandController.shared.revealLive()
         if skipNextStopSound {
             skipNextStopSound = false
         } else {
@@ -759,18 +776,14 @@ final class DictationEngine {
 
         let audioBuffer = audioCapture.stopRecording(trimTrailingSeconds: trimTrailingSeconds)
 
-        // Check minimum duration
-        if let start = recordingStartTime,
-           Date().timeIntervalSince(start) < minRecordingDuration {
+        let started = captureRequestedAt ?? recordingStartTime
+        let tooShort = started.map { Date().timeIntervalSince($0) < minRecordingDuration } ?? true
+        if tooShort || audioBuffer.isEmpty || !AudioCapture.hasSpeech(audioBuffer) {
             returnToIdle()
             return
         }
 
-        guard !audioBuffer.isEmpty else {
-            returnToIdle()
-            return
-        }
-
+        IslandController.shared.revealLive()
         state = .processing
 
         let bridge = self.whisperBridge
@@ -787,14 +800,20 @@ final class DictationEngine {
             // wait (typing itself runs on the injector's own queue), which is the same
             // accepted tradeoff the old synchronous transcribe made.
             func finish(transcript: String?, error: String?) async {
+                let cleaned = Self.withoutHallucinatedEnding(transcript ?? "")
+                if !cleaned.isEmpty {
+                    injector.type(text: cleaned)
+                }
                 injector.flush()
                 await MainActor.run { [weak self] in
                     guard let self, self.captureGeneration == generation else { return }
-                    if let transcript, !transcript.isEmpty {
-                        self.commitTranscript(transcript)
+                    if !cleaned.isEmpty {
+                        self.commitTranscript(cleaned)
                     }
                     if let error { self.transcriptionError = error }
-                    feedback.playDoneSound()
+                    if !cleaned.isEmpty || error != nil {
+                        feedback.playDoneSound()
+                    }
                     self.returnToIdle()
                 }
             }
@@ -818,8 +837,7 @@ final class DictationEngine {
             do {
                 _ = try await bridge.transcribe(audioBuffer: audioBuffer, prompt: prompt) { segment in
                     let corrected = TextCorrector.shared.correct(segment)
-                    // Never log transcribed content — it's the user's private dictation.
-                    injector.type(text: collected.joinAndAppend(corrected))
+                    _ = collected.joinAndAppend(corrected)
                 }
             } catch let error as WhisperError where error.isCancellation {
                 fputs("[DictationEngine] Transcription cancelled by user.\n", stderr)
@@ -861,6 +879,94 @@ final class DictationEngine {
         return !".!?".contains(last)
     }
 
+    /// Exact fake sign-offs only. A real sentence is never shortened just
+    /// because it shares a word with one of these.
+    static func withoutHallucinatedEnding(_ text: String) -> String {
+        let phrases: Set<String> = [
+            "thanks for watching",
+            "thank you for watching",
+            "so thanks for watching",
+            "thanks for listening",
+            "thank you for listening",
+            "please subscribe",
+            "like and subscribe",
+            "please like and subscribe",
+            "see you next time",
+            "see you in the next video",
+            "ill see you next time",
+            "i will see you next time",
+            "ill see you in the next video",
+            "i will see you in the next video",
+            "im chris",
+            "i am chris",
+            "and im chris",
+            "im going to talk to you soon",
+            "i am going to talk to you soon",
+            "im gonna talk to you soon",
+            "ill talk to you soon",
+            "talk to you soon",
+        ]
+        let goodbyes: Set<String> = ["bye", "goodbye", "bye bye"]
+        var rest = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        while !rest.isEmpty {
+            let (prefix, sentence) = splitLastSentence(rest)
+            let key = normalizedSentence(sentence)
+            if goodbyes.contains(key) {
+                let (_, previous) = splitLastSentence(prefix)
+                guard isExactOutro(previous, phrases: phrases) else { break }
+                rest = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+                continue
+            }
+            guard isExactOutro(sentence, phrases: phrases) else { break }
+            rest = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return rest
+    }
+
+    private static func isExactOutro(_ sentence: String, phrases: Set<String>) -> Bool {
+        let key = normalizedSentence(sentence)
+        if phrases.contains(key) { return true }
+        let clauses = sentence.split(separator: ",").map { clause -> String in
+            var words = normalizedSentence(String(clause)).split(separator: " ").map(String.init)
+            if words.first == "and" { words.removeFirst() }
+            return words.joined(separator: " ")
+        }.filter { !$0.isEmpty }
+        return clauses.count > 1 && clauses.allSatisfy { phrases.contains($0) }
+    }
+
+    private static func splitLastSentence(_ text: String) -> (prefix: String, sentence: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var splitAt = trimmed.startIndex
+        var index = trimmed.endIndex
+        var seenWord = false
+        while index > trimmed.startIndex {
+            let previous = trimmed.index(before: index)
+            let character = trimmed[previous]
+            if ".!?".contains(character), seenWord {
+                splitAt = index
+                break
+            }
+            if character.isLetter { seenWord = true }
+            index = previous
+        }
+        return (String(trimmed[..<splitAt]), String(trimmed[splitAt...]).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private static func normalizedSentence(_ sentence: String) -> String {
+        var words: [String] = []
+        var current = ""
+        for scalar in sentence.lowercased() {
+            if scalar.isLetter || scalar == "'" || scalar == "’" {
+                current.append(scalar == "’" ? "'" : scalar)
+            } else if !current.isEmpty {
+                words.append(current.replacingOccurrences(of: "'", with: ""))
+                current = ""
+            }
+        }
+        if !current.isEmpty { words.append(current.replacingOccurrences(of: "'", with: "")) }
+        return words.joined(separator: " ")
+    }
+
     private var liveSegmenter: VADSegmenter?
     private var liveContinuation: AsyncStream<LiveWorkItem>.Continuation?
     private var liveSessionFlag: CancellationFlag?
@@ -887,6 +993,9 @@ final class DictationEngine {
             liveSegmenter = segmenter
             liveContinuation = continuation
             liveSessionFlag = sessionFlag
+            liveChunkLock.lock()
+            liveChunksCommitted = 0
+            liveChunkLock.unlock()
 
             // Invoked synchronously on the segmenter's queue, so it must touch
             // NO main-actor state: the continuation is captured by value, never
@@ -895,7 +1004,14 @@ final class DictationEngine {
             // barrier happens-after every commit's yield — so every committed
             // chunk is in the stream before the residual and `finish()`, and none
             // can be orphaned by the stop path clearing `liveContinuation`.
-            segmenter.onChunk = { chunk in continuation.yield(.chunk(chunk)) }
+            segmenter.onChunk = { [weak self] chunk in
+                if let self {
+                    self.liveChunkLock.lock()
+                    self.liveChunksCommitted += 1
+                    self.liveChunkLock.unlock()
+                }
+                continuation.yield(.chunk(chunk))
+            }
             audioCapture.onSamples = { samples in segmenter.append(samples) }
             segmenter.start()
             runLiveConsumer(stream: stream, bridge: bridge, sessionFlag: sessionFlag)
@@ -929,10 +1045,10 @@ final class DictationEngine {
                 if sessionFlag.isCancelled && surfacedError == nil {
                     continue   // user cancel during drain: skip remaining work silently
                 }
-                let (samples, isResidual): ([Float], Bool)
+                let samples: [Float]
                 switch item {
-                case .chunk(let s): (samples, isResidual) = (s, false)
-                case .residual(let s): (samples, isResidual) = (s, true)
+                case .chunk(let s), .residual(let s):
+                    samples = s
                 }
                 guard surfacedError == nil else { continue }  // failure: drain and discard
 
@@ -946,7 +1062,7 @@ final class DictationEngine {
                         audioBuffer: samples,
                         prompt: prompt,
                         cancelFlag: sessionFlag,
-                        vad: isResidual   // chunks are pre-trimmed; residual is raw
+                        vad: false
                     ) { segment in
                         let context = CorrectionContext(
                             atSentenceStart: collected.atSentenceStart,
@@ -954,7 +1070,7 @@ final class DictationEngine {
                         )
                         let corrected = TextCorrector.shared.correct(segment, context: context)
                         guard !corrected.isEmpty else { return }
-                        injector.type(text: collected.joinAndAppend(corrected))
+                        _ = collected.joinAndAppend(corrected)
                     }
                 } catch let error as WhisperError where error.isCancellation {
                     continue   // silent: user cancel, or cascade after a failure
@@ -965,34 +1081,77 @@ final class DictationEngine {
                 }
             }
 
-            // Stream closed: stop-time finish (unconditional drain + flush).
-            if surfacedError == nil, Self.needsTerminalPeriod(committed: collected.text) {
-                injector.type(text: ".")
+            // Decode stayed ahead of the key release. Paste the whole note once.
+            // If that pass came back empty, transcribe the original recording.
+            var transcript = Self.withoutHallucinatedEnding(collected.text)
+            if transcript.isEmpty, surfacedError == nil, !sessionFlag.isCancelled {
+                let fallback: [Float] = await MainActor.run { [weak self] in
+                    guard let self, self.captureGeneration == generation else { return [] }
+                    let audio = self.liveFallbackAudio
+                    self.liveFallbackAudio = []
+                    return audio
+                }
+                if AudioCapture.hasSpeech(fallback) {
+                    await MainActor.run { [weak self] in
+                        guard let self, self.captureGeneration == generation else { return }
+                        IslandController.shared.revealLive()
+                        self.state = .typing
+                    }
+                    let recovered = TranscriptCollector()
+                    let prompt = Self.buildPrompt(
+                        base: AppSettings.shared.vocabularyPrompt,
+                        customTerms: AppSettings.shared.customTerms
+                    )
+                    do {
+                        _ = try await bridge.transcribe(audioBuffer: fallback, prompt: prompt, vad: false) { segment in
+                            let corrected = TextCorrector.shared.correct(segment)
+                            guard !corrected.isEmpty else { return }
+                            _ = recovered.joinAndAppend(corrected)
+                        }
+                        transcript = recovered.text
+                    } catch {
+                        fputs("[DictationEngine] Fallback transcription failed: \(error)\n", stderr)
+                    }
+                }
+            } else {
+                await MainActor.run { [weak self] in
+                    self?.liveFallbackAudio = []
+                }
+            }
+            transcript = Self.withoutHallucinatedEnding(transcript)
+            if surfacedError == nil, !transcript.isEmpty, Self.needsTerminalPeriod(committed: transcript) {
+                transcript += "."
+            }
+            if !transcript.isEmpty {
+                injector.type(text: transcript)
             }
             injector.flush()
 
             let finalError = surfacedError
+            let finalTranscript = transcript
             await MainActor.run { [weak self] in
                 guard let self, self.captureGeneration == generation else { return }
-                if !collected.text.isEmpty {
-                    var transcript = collected.text
-                    if Self.needsTerminalPeriod(committed: transcript) { transcript += "." }
-                    self.commitTranscript(transcript)
+                if !finalTranscript.isEmpty {
+                    self.commitTranscript(finalTranscript)
                 }
                 if let finalError { self.transcriptionError = finalError }
-                feedback.playDoneSound()
-                self.returnToIdle()
+                if !finalTranscript.isEmpty || finalError != nil {
+                    feedback.playDoneSound()
+                }
+                if self.state != .idle {
+                    self.returnToIdle()
+                }
             }
         }
     }
 
-    /// Live stop: discard the full capture buffer (its speech was already
-    /// committed chunk-by-chunk), collect the segmenter's residual, and close
-    /// the stream — the consumer owns everything after this point, including
-    /// returnToIdle. State moves to .processing/.typing to cover the drain.
+    /// Live stop. The pause detector's pieces are used when they produced text.
+    /// The full recording is kept so a deliberate release still pastes when those
+    /// pieces come back empty. A silent hold hides immediately.
     private func stopLiveSession(trimTrailingSeconds: TimeInterval) {
         audioCapture.onSamples = nil
-        _ = audioCapture.stopRecording()   // tap removed; buffer intentionally discarded
+        let fullBuffer = audioCapture.stopRecording(trimTrailingSeconds: trimTrailingSeconds)
+        liveFallbackAudio = fullBuffer
         recordingStartTime = nil
 
         var residual = liveSegmenter?.finishAndCollectResidual() ?? []
@@ -1001,14 +1160,26 @@ final class DictationEngine {
             residual = residual.count > toTrim ? Array(residual.dropLast(toTrim)) : []
         }
 
-        state = .processing
-        if Self.residualMeetsMinimum(sampleCount: residual.count) {
-            state = .typing
+        liveChunkLock.lock()
+        let chunks = liveChunksCommitted
+        liveChunkLock.unlock()
+
+        let residualHasSpeech = AudioCapture.hasSpeech(residual) || AudioCapture.hasTrailingSpeech(residual)
+        let keepFullRecording = AudioCapture.hasSpeech(fullBuffer)
+
+        if residualHasSpeech {
             liveContinuation?.yield(.residual(residual))
         }
-        liveContinuation?.finish()   // consumer drains, flushes, returns to idle
+        liveContinuation?.finish()
         drainCancelFlag = liveSessionFlag
         clearLiveSessionReferences()
+
+        if residualHasSpeech || chunks > 0 || keepFullRecording {
+            IslandController.shared.revealLive()
+            state = chunks > 0 || residualHasSpeech ? .typing : .processing
+        } else {
+            returnToIdle()
+        }
     }
 
     /// Drop main-actor references to the session. The consumer task holds its
@@ -1078,23 +1249,8 @@ final class DictationEngine {
     private func handleInputConfigurationChange() {
         Task { @MainActor [weak self] in
             guard let self, self.state == .recording else { return }
-            if self.isLiveSession {
-                fputs("[DictationEngine] Audio input changed during live session — stopping.\n", stderr)
-                self.audioCapture.onSamples = nil
-                _ = self.audioCapture.stopRecording()
-                self.soundFeedback.playStopSound()
-                self.recordingStartTime = nil
-                self.state = .processing        // consumer's finish returns to idle
-                self.teardownLiveSession()      // residual discarded; committed text remains
-                self.transcriptionError = "Audio input changed. Recording stopped."
-                return
-            }
-            fputs("[DictationEngine] Audio input configuration changed during recording — stopping.\n", stderr)
-            _ = self.audioCapture.stopRecording()
-            self.soundFeedback.playStopSound()
-            self.recordingStartTime = nil
-            self.returnToIdle()
-            self.transcriptionError = "Audio input changed. Recording stopped."
+            fputs("[DictationEngine] Audio input changed — transcribing what was captured.\n", stderr)
+            self.stopRecordingAndTranscribe()
         }
     }
 }

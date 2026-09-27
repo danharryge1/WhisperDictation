@@ -107,7 +107,7 @@ struct OnboardingView: View {
             }
 
             VStack(spacing: 8) {
-                Text("Welcome to WhisperDictation")
+                Text("Welcome to Dan's Whisper Flow")
                     .font(.system(size: 22, weight: .bold))
                 Text("Local, private voice-to-text powered by Whisper AI.\nHold a key to speak, release to type — nothing leaves your Mac.")
                     .font(.system(size: 13))
@@ -122,7 +122,7 @@ struct OnboardingView: View {
 
     private var permissionsStep: some View {
         VStack(spacing: 16) {
-            stepHeading("Grant Permissions", "WhisperDictation needs two permissions to work.")
+            stepHeading("Grant Permissions", "Dan's Whisper Flow needs two permissions to work.")
 
             VStack(spacing: 12) {
                 OnboardingRow(

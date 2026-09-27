@@ -1,3 +1,23 @@
+# Dan's Whisper Flow
+
+Hold the **fn** key. Talk. Let go. Your words show up where you were typing.
+
+It stays on your Mac. Nothing is sent to the internet after the first download.
+
+Windows does not work. This is a Mac app only.
+
+## Mac
+
+1. Download **DansWhisperFlow.zip** from the latest release on this page.
+2. Double-click the zip. You get an app called **Dan's Whisper Flow**.
+3. Drag that app into **Applications**.
+4. Do not double-click it yet. **Right-click** the app and choose **Open**. Click **Open** again when the Mac warns you.
+5. Click the menu bar icon. Allow the **microphone** and **Accessibility** when it asks. If Accessibility does not stick, open **System Settings**, search **Accessibility**, turn **Dan's Whisper Flow** on.
+6. The first time, it downloads a speech model. Wait until it says it is ready. You need Wi-Fi for that once.
+7. Click into any text box. Hold **fn**, talk, let go.
+
+If the Mac says it cannot be opened, use the right-click **Open** step again. Do not move the app out of Applications.
+
 <p align="center">
   <h1 align="center">WhisperDictation</h1>
   <p align="center">

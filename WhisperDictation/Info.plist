@@ -12,6 +12,8 @@
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleDisplayName</key>
+	<string>Dan's Whisper Flow</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
@@ -23,7 +25,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>WhisperDictation needs microphone access to capture your voice for speech-to-text transcription.</string>
+	<string>Dan's Whisper Flow needs the microphone to turn your voice into text.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

@@ -18,13 +18,13 @@ struct WhisperDictationApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Window("WhisperDictation Settings", id: "settings") {
+        Window("Dan's Whisper Flow Settings", id: "settings") {
             SettingsView(engine: engine)
         }
         .windowResizability(.contentSize)
         .defaultPosition(.center)
 
-        Window("Welcome to WhisperDictation", id: "onboarding") {
+        Window("Welcome to Dan's Whisper Flow", id: "onboarding") {
             OnboardingView(engine: engine)
         }
         .windowResizability(.contentSize)

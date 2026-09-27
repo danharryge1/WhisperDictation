@@ -23,6 +23,8 @@ private func segmentCallback(
     let totalSegments = whisper_full_n_segments(ctx)
     let start = max(0, totalSegments - nNew)
     for i in start..<totalSegments {
+        let noSpeech = whisper_full_get_segment_no_speech_prob(ctx, i)
+        if noSpeech >= 0.6 { continue }
         if let text = whisper_full_get_segment_text(ctx, i) {
             let segment = String(cString: text).trimmingCharacters(in: .whitespaces)
             if !segment.isEmpty {

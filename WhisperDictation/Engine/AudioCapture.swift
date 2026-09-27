@@ -254,6 +254,32 @@ final class AudioCapture {
             return rmsEnergy(samples[start..<end])
         }
     }
+
+    /// Empty-hold gate. Quiet speech still passes; a silent room does not.
+    static func hasSpeech(_ samples: [Float]) -> Bool {
+        guard samples.count >= 1600 else { return false }
+        var peak: Float = 0
+        var sum: Float = 0
+        for sample in samples {
+            let amplitude = abs(sample)
+            if amplitude > peak { peak = amplitude }
+            sum += sample * sample
+        }
+        let rms = sqrt(sum / Float(samples.count))
+        return peak >= 0.012 && rms >= 0.0015
+    }
+
+    /// Release tail. The last phrase often has no pause yet, and it trails off
+    /// quieter than a full utterance, so the normal gate drops it.
+    static func hasTrailingSpeech(_ samples: [Float]) -> Bool {
+        guard samples.count >= 2400 else { return false }
+        var peak: Float = 0
+        for sample in samples {
+            let amplitude = abs(sample)
+            if amplitude > peak { peak = amplitude }
+        }
+        return peak >= 0.008
+    }
 }
 
 enum AudioCaptureError: LocalizedError {
